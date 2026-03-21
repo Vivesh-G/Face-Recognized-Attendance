@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from .Mobilenet import MobileNetV3_backbone
 from .utils import Transformer, extract_patches_pytorch_gridsample
 from timm.models.layers import trunc_normal_
 from einops import rearrange, repeat
@@ -15,7 +14,7 @@ class ViT_face_landmark_patch8(nn.Module):
     """
     Part-fViT: Landmark-based Facial Vision Transformer
     
-    Uses MobileNetV3 to predict facial landmarks, then extracts patches
+    Uses EdgeFace to predict facial landmarks, then extracts patches
     at those landmark locations for the transformer to process.
     """
     def __init__(
@@ -41,16 +40,20 @@ class ViT_face_landmark_patch8(nn.Module):
         
         self.patch_size = patch_size
         self.num_patches = num_patches
-        self.row_num = int(np.sqrt(num_patches))  # 14 for 196 patches
+        self.row_num = int(np.sqrt(num_patches))
         self.dim = dim
         
-        # Landmark detection network (MobileNetV3)
-        self.stn = MobileNetV3_backbone(mode='large')
+        # Landmark detection network (EdgeFace via torch.hub)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.stn = torch.hub.load(
+            'otroshi/edgeface', 'edgeface_xs_gamma_06',
+            source='github', pretrained=True
+        ).to(self.device).eval()
         
-        # Output layer: MobileNetV3 features (160-dim) -> landmark coordinates (14*14*2=392)
+        # Output layer: EdgeFace embeddings (512-dim) -> landmark coordinates (14*14*2=392)
         self.output_layer = nn.Sequential(
             nn.Dropout(p=0.5),
-            nn.Linear(160, self.row_num * self.row_num * 2),
+            nn.Linear(512, self.row_num * self.row_num * 2),
         )
         
         # Patch shape for extraction
@@ -84,9 +87,9 @@ class ViT_face_landmark_patch8(nn.Module):
     def forward(self, x, visualize=False):
         p = self.patch_size
         
-        # 1. Get landmark features from MobileNetV3
-        theta0 = self.stn(x)
-        theta0 = theta0.mean(dim=(-2, -1))  # Global average pooling
+        # 1. Get landmark features from EdgeFace (512-D embeddings, already pooled)
+        with torch.no_grad():
+            theta0 = self.stn(x)
         
         # 2. Predict landmark coordinates
         theta = self.output_layer(theta0)

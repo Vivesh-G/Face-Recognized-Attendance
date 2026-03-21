@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+facenet-pytorch
+torch
+torchvision
+opencv-python
+Pillow
+numpy
+timm
+einops

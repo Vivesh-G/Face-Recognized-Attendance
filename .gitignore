@@ -11,3 +11,9 @@ wheels/
 
 # Model files
 *.pth
+
+dataset/
+
+attendance/
+
+embeddings/

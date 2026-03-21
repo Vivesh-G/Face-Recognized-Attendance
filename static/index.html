@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Part-fViT Attendance System</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <h1>Part-fViT Attendance System</h1>
+  <span id="live-badge">LIVE</span>
+  <div class="header-actions">
+    <button class="btn btn-sm" onclick="rebuildDB()">Rebuild DB</button>
+    <button class="btn btn-sm" onclick="loadAttendance()">Refresh</button>
+    <button class="btn btn-sm" onclick="exportCSV()">Export CSV</button>
+  </div>
+</header>
+
+<div class="main">
+
+  <!-- LEFT -->
+  <div class="left-column">
+
+    <div class="card">
+      <h2>Live Camera Feed</h2>
+      <div id="vcont">
+        <div id="vplaceholder"><span>[ ]</span><span>Camera is off</span></div>
+        <img id="vfeed" alt="feed">
+      </div>
+      <div class="btn-group">
+        <button class="btn btn-black" onclick="startCam()">Start Camera</button>
+        <button class="btn" onclick="stopCam()">Stop Camera</button>
+      </div>
+      <div class="sep"></div>
+      <h2>Detected Faces</h2>
+      <ul id="det-list"><li>No faces detected</li></ul>
+    </div>
+
+    <div class="card">
+      <h2>Upload & Identify</h2>
+      <div id="dropzone" onclick="document.getElementById('fin').click()">
+        <div class="upload-label">IMAGE UPLOAD</div>
+        Click or drag an image to identify faces
+      </div>
+      <input type="file" id="fin" accept="image/*" title="Choose image to upload" onchange="uploadImg(this)">
+      <img id="uppreview" alt="preview">
+      <div id="up-res"></div>
+    </div>
+
+    <div class="card" id="enroll-section">
+      <h2>Enroll New Person</h2>
+      <div class="enroll-group">
+        <input type="text" id="enroll-name" placeholder="Full name">
+        <input type="text" id="enroll-class" placeholder="Class (e.g. B)">
+      </div>
+       <div class="enroll-group">
+         <input type="text" id="enroll-dept" placeholder="Dept (e.g. AIDS)">
+         <label for="enroll-file" class="btn btn-black btn-sm">Choose Image</label>
+         <input type="file" id="enroll-file" accept="image/*">
+       </div>
+       <button class="btn btn-black" id="enroll-btn" onclick="enrollPerson()">Enroll</button>
+    </div>
+
+  </div>
+
+  <!-- RIGHT -->
+  <div class="card">
+    <h2>Today's Attendance - <span id="tdate"></span></h2>
+    <div class="stats">
+      <div class="stat"><div class="stat-n" id="st-total">0</div><div class="stat-l">Total</div></div>
+      <div class="stat"><div class="stat-n" id="st-pres">0</div><div class="stat-l">Present</div></div>
+      <div class="stat"><div class="stat-n" id="st-abs">0</div><div class="stat-l">Absent</div></div>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr>
+          <th>Name</th><th>Class</th><th>Dept</th>
+          <th>Status</th><th>Time</th><th>Confidence</th><th>Action</th>
+        </tr></thead>
+        <tbody id="atbl"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div><!-- /main -->
+
+<div id="toast"></div>
+
+<script>
+document.getElementById('tdate').textContent = new Date().toLocaleDateString('en-IN',{dateStyle:'medium'});
+
+let camActive = false, pollId = null;
+
+// drag-and-drop
+const dz = document.getElementById('dropzone');
+dz.addEventListener('dragover', e=>{ e.preventDefault(); dz.style.background='#f5f5f5'; });
+dz.addEventListener('dragleave', ()=>{ dz.style.background=''; });
+dz.addEventListener('drop', e=>{
+  e.preventDefault(); dz.style.background='';
+  const f = e.dataTransfer.files[0];
+  if(f){ document.getElementById('fin').files = e.dataTransfer.files; uploadImg(document.getElementById('fin')); }
+});
+
+async function api(url, method='GET', body=null){
+  const o={method, headers:{}};
+  if(body && !(body instanceof FormData)){o.headers['Content-Type']='application/json'; o.body=JSON.stringify(body);}
+  else if(body) o.body=body;
+  try {
+    const r = await fetch(url,o);
+    return await r.json();
+  } catch(e) {
+    console.error('API error:', e);
+    return {error: e.message};
+  }
+}
+
+function toast(msg, isSuccess=true){
+  const t=document.getElementById('toast');
+  t.textContent=msg;
+  t.style.opacity=1;
+  setTimeout(()=>t.style.opacity=0, 3200);
+}
+
+async function startCam(){
+  if(camActive) return;
+  const res = await api('/api/camera/start','POST');
+  if(res.error) { toast('Camera error: '+res.error); return; }
+  camActive=true;
+  document.getElementById('vfeed').src='/api/camera/stream';
+  document.getElementById('vfeed').style.display='block';
+  document.getElementById('vplaceholder').style.display='none';
+  document.getElementById('live-badge').style.display='inline';
+  pollId = setInterval(()=>{ pollResults(); loadAttendance(); }, 2000);
+  toast('Camera started');
+}
+
+async function stopCam(){
+  if(!camActive) return;
+  await api('/api/camera/stop','POST');
+  camActive=false;
+  clearInterval(pollId);
+  document.getElementById('vfeed').src='';
+  document.getElementById('vfeed').style.display='none';
+  document.getElementById('vplaceholder').style.display='flex';
+  document.getElementById('live-badge').style.display='none';
+  renderDet([]);
+  loadAttendance();
+  toast('Camera stopped');
+}
+
+async function pollResults(){
+  const d = await api('/api/detections');
+  renderDet(d.detections||[]);
+}
+
+function renderDet(results){
+  const ul=document.getElementById('det-list');
+  if(!results.length){
+    ul.innerHTML='<li style="color:#666666">No faces detected</li>'; return;
+  }
+  ul.innerHTML = results.map(r=>`
+    <li>
+      <div>
+        <span style="font-weight:600;color:#000000">${r.name}</span>
+        <div style="color:#666666;font-size:.75rem">Confidence: ${(r.sim*100).toFixed(1)}%</div>
+      </div>
+      <div style="text-align:right">
+        <div class="conf-bar"><div class="conf-fill" style="width:${Math.min(r.sim*100,100)}%"></div></div>
+      </div>
+    </li>`).join('');
+}
+
+async function uploadImg(inp){
+  const file=inp.files[0]; if(!file) return;
+  const prev=document.getElementById('uppreview');
+  prev.src=URL.createObjectURL(file); prev.style.display='block';
+  document.getElementById('up-res').textContent='Identifying…';
+  const fd=new FormData(); fd.append('file',file);
+  const d = await fetch('/api/upload',{method:'POST',body:fd}).then(r=>r.json());
+  const res=d.detections||[];
+  document.getElementById('up-res').innerHTML = res.length
+    ? res.map(r=>`<span style="color:#000000;display:block;margin:.25rem 0"><strong>${r.name}</strong> ${(r.sim*100).toFixed(1)}%</span>`).join('')
+    : 'No faces detected.';
+  loadAttendance();
+}
+
+async function enrollPerson(){
+  const name = document.getElementById('enroll-name').value.trim();
+  const cls = document.getElementById('enroll-class').value.trim();
+  const dept = document.getElementById('enroll-dept').value.trim();
+  const file = document.getElementById('enroll-file').files[0];
+  if(!name || !file) { toast('Please fill name and choose image'); return; }
+  
+  document.getElementById('enroll-btn').disabled = true;
+  document.getElementById('enroll-btn').textContent = 'Enrolling...';
+  
+  const fd = new FormData();
+  fd.append('file', file);
+  
+  const url = `/api/enroll?name=${encodeURIComponent(name)}&cls=${encodeURIComponent(cls)}&dept=${encodeURIComponent(dept)}`;
+  const res = await fetch(url, {method:'POST', body:fd}).then(r=>r.json());
+  
+  document.getElementById('enroll-btn').disabled = false;
+  document.getElementById('enroll-btn').textContent = 'Enroll';
+  
+  if(res.error) {
+    toast('Enrollment failed: '+res.error);
+  } else {
+    toast('Enrolled: '+name);
+    document.getElementById('enroll-name').value = '';
+    document.getElementById('enroll-class').value = '';
+    document.getElementById('enroll-dept').value = '';
+    document.getElementById('enroll-file').value = '';
+    loadAttendance();
+  }
+}
+
+async function loadAttendance(){
+  try {
+    const d=await api('/api/attendance');
+    if(d.error) {
+      console.error('Attendance API error:', d.error);
+      return;
+    }
+    const rows=d.records||[];
+    const pres=d.present||0;
+    const total=d.total||0;
+    document.getElementById('st-total').textContent=total;
+    document.getElementById('st-pres').textContent=pres;
+    document.getElementById('st-abs').textContent=total-pres;
+    document.getElementById('atbl').innerHTML=rows.map(r=>`
+      <tr>
+        <td style="font-weight:500">${r.Name}</td>
+        <td style="color:#666666">${r.Class||'-'}</td>
+        <td style="color:#666666">${r.Department||'-'}</td>
+        <td><span class="badge ${r.Status==='Present'?'bp':'ba'}">${r.Status}</span></td>
+        <td style="color:#666666;font-size:.75rem">${r.Time||'-'}</td>
+        <td style="color:#666666;font-size:.75rem">${r.Confidence||'-'}</td>
+        <td>${r.Status==='Absent'
+          ?`<button class="btn btn-sm" onclick="toggle('${r.Name}','Present')">Mark</button>`
+          :`<button class="btn btn-sm" onclick="toggle('${r.Name}','Absent')">Unmark</button>`
+        }</td>
+      </tr>`).join('');
+    if(total === 0) {
+      console.log('No attendance records. Enroll some people first or click "Rebuild DB"');
+    }
+  } catch(e) {
+    console.error('Failed to load attendance:', e);
+  }
+}
+
+async function toggle(name, status){
+  await api('/api/attendance/update','POST',{name,status});
+  toast(`${name} marked as ${status}`);
+  loadAttendance();
+}
+
+async function rebuildDB(){
+  toast('Building face database from dataset folder...');
+  const d=await api('/api/rebuild-db','POST');
+  if(d.error) {
+    toast('Error: '+d.error);
+  } else {
+    toast(d.status);
+  }
+  loadAttendance();
+}
+
+function exportCSV(){ window.open('/api/attendance/export','_blank'); }
+
+loadAttendance();
+
+// Auto-refresh attendance every 5 seconds when camera is active
+setInterval(()=>{
+  if(camActive) loadAttendance();
+}, 5000);
+</script>
+</body>
+</html>

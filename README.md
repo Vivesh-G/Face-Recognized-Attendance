@@ -84,4 +84,20 @@ This project is for educational and research purposes.
 
 ## Acknowledgments
 
-- Part-fViT: Landmark-aware Facial Vision Transformer ([Link](https://github.com/szlbiubiubiu/LAFS_CVPR2024)), [arxiv](https://arxiv.org/abs/2403.08161)
+```
+@article{edgeface,
+  title={Edgeface: Efficient face recognition model for edge devices},
+  author={George, Anjith and Ecabert, Christophe and Shahreza, Hatef Otroshi and Kotwal, Ketan and Marcel, Sebastien},
+  journal={IEEE Transactions on Biometrics, Behavior, and Identity Science},
+  year={2024}
+}
+```
+```
+@InProceedings{Sun_2024_CVPR,
+    author    = {Sun, Zhonglin and Feng, Chen and Patras, Ioannis and Tzimiropoulos, Georgios},
+    title     = {LAFS: Landmark-based Facial Self-supervised Learning for Face Recognition},
+    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    month     = {June},
+    year      = {2024}
+}
+```

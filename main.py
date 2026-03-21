@@ -1,218 +1,332 @@
-import torch
-import cv2
-import numpy as np
-from facenet_pytorch import MTCNN
-from datetime import datetime
+"""
+main.py  –  FastAPI Attendance System with Part-fViT
+Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+"""
 import os
-from LAFS import PartfVit
+import cv2
+import base64
+import threading
+import time
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, UploadFile, File, Body
+from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import numpy as np
+from PIL import Image
 
-# Attendance System with Part-fViT
-class AttendanceSystem:
-    def __init__(self, model_path, device='cuda' if torch.cuda.is_available() else 'cpu', db_path='data/embeddings.pth'):
-        self.device = device
-        self.db_path = db_path
-        self.face_detector = MTCNN(keep_all=True, device=self.device)
-        
-        # Initialize Part-fViT
-        self.recognition_model = PartfVit.ViT_face_landmark_patch8(
-            image_size=112,
-            patch_size=8,
-            dim=768,
-            depth=12,
-            heads=11,
-            mlp_dim=2048,
-            dropout=0.1,
-            emb_dropout=0.1,
-            num_patches=196
-        )
-        
-        self.load_checkpoint(model_path)
-        self.recognition_model.to(self.device)
-        self.recognition_model.eval()
-        
-        self.known_embeddings = {}
-        self.attendance_log = [] # Changed to list of dicts for easier CSV export
-        self.load_known_faces()
+from LAFS.face_engine import FaceEngine
+from attendance_manager import (
+    mark_present, get_attendance, update_attendance,
+    ensure_today, get_csv_path
+)
 
-    def load_known_faces(self):
-        """Load saved embeddings from disk if they exist"""
-        if os.path.exists(self.db_path):
-            self.known_embeddings = torch.load(self.db_path)
-            print(f"Loaded {len(self.known_embeddings)} registered students from database.")
+DATASET_DIR = "dataset"
+EMBEDDINGS_DIR = "embeddings"
+MODEL_PATH = "lafs_webface_finetune_withaugmentation.pth"
 
-    def save_known_faces(self):
-        """Save embeddings to disk"""
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        torch.save(self.known_embeddings, self.db_path)
+os.makedirs(DATASET_DIR, exist_ok=True)
+os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
 
-    def load_checkpoint(self, path):
-        if not os.path.exists(path):
-            print(f"Warning: Checkpoint not found at {path}. Model will use random weights.")
-            return
-            
-        print(f"Loading Part-fViT checkpoint from {path}...")
-        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-        
-        # Handle different checkpoint formats
-        if isinstance(checkpoint, dict):
-            if 'teacher' in checkpoint:
-                state_dict = checkpoint['teacher']
-            elif 'model' in checkpoint:
-                state_dict = checkpoint['model']
-            else:
-                state_dict = checkpoint
+engine = FaceEngine(model_path=MODEL_PATH, threshold=0.5)
+
+
+# ──────────────────────────── Models ──────────────────────────────── #
+class AttendanceUpdate(BaseModel):
+    """Request model for attendance status update."""
+    name: str
+    status: str
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load database on startup."""
+    engine.load_db(EMBEDDINGS_DIR)
+    # Always ensure attendance CSV is created
+    people_meta = {k: v["meta"] for k, v in engine.db.items()} if engine.db else {}
+    ensure_today(people_meta)
+    print(f"[INFO] Loaded {len(engine.db)} people, attendance CSV ready")
+    yield
+
+
+app = FastAPI(title="Part-fViT Attendance System", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Mount static files
+if os.path.exists("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# ──────────────────────────── Camera State ──────────────────────────── #
+_cam_lock = threading.Lock()
+_latest_frame = None  # annotated BGR frame
+_latest_results: list[dict] = []
+_camera_active = False
+_marked_today: set[str] = set()
+
+
+def _camera_worker():
+    """Background camera processing thread."""
+    global _latest_frame, _latest_results, _camera_active, _marked_today
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[ERROR] Cannot open camera")
+        _camera_active = False
+        return
+
+    frame_n = 0
+    current_results: list[dict] = []
+
+    while _camera_active:
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.05)
+            continue
+
+        frame_n += 1
+
+        # Run recognition every 3rd frame for efficiency
+        if frame_n % 3 == 0:
+            current_results = engine.process_frame(frame)
+            _latest_results = current_results
+
+            # Auto-mark attendance
+            people_meta = {k: v["meta"] for k, v in engine.db.items()}
+            for r in current_results:
+                if r["name"] != "UNK" and r["name"] not in _marked_today:
+                    if mark_present(r["name"], r["sim"], people_meta):
+                        _marked_today.add(r["name"])
+                        print(f"[ATTEND] Marked present: {r['name']}")
+
+        # Draw boxes on every frame (smooth video)
+        display = frame.copy()
+        for r in current_results:
+            x1, y1, x2, y2 = r["box"]
+            is_known = r["name"] != "UNK"
+            color = (0, 220, 80) if is_known else (0, 60, 220)
+            label = f"{r['name']} {r['sim']*100:.1f}%"
+            cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(display, (x1, y1 - 24), (x1 + len(label)*11, y1), color, -1)
+            cv2.putText(display, label, (x1 + 3, y1 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
+        with _cam_lock:
+            _latest_frame = display
+
+    cap.release()
+    print("[CAM] Released")
+
+
+def _gen_mjpeg():
+    """Generator for MJPEG streaming."""
+    while True:
+        with _cam_lock:
+            frame = _latest_frame
+        if frame is not None:
+            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
         else:
-            state_dict = checkpoint
+            time.sleep(0.1)
 
-        # Clean keys
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            new_k = k.replace("module.", "").replace("backbone.", "").replace("encoder.", "")
-            new_state_dict[new_k] = v
-            
-        model_dict = self.recognition_model.state_dict()
-        pretrained_dict = {k: v for k, v in new_state_dict.items() 
-                          if k in model_dict and v.shape == model_dict[k].shape}
-        model_dict.update(pretrained_dict)
-        self.recognition_model.load_state_dict(model_dict)
-        print(f"Loaded {len(pretrained_dict)}/{len(model_dict)} layers.")
 
-    def preprocess(self, img_bgr):
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img_resized = cv2.resize(img_rgb, (112, 112))
-        img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float()
-        img_tensor = (img_tensor / 255.0 - 0.5) / 0.5
-        return img_tensor.unsqueeze(0).to(self.device)
+# ──────────────────────────── Routes ──────────────────────────────── #
 
-    def get_embedding(self, face_img):
-        tensor = self.preprocess(face_img)
-        with torch.no_grad():
-            embedding = self.recognition_model(tensor)
-            return torch.nn.functional.normalize(embedding).cpu().numpy().flatten()
+@app.get("/", response_class=HTMLResponse)
+async def get_index():
+    """Serve HTML homepage."""
+    with open("static/index.html", "r") as f:
+        return f.read()
 
-    def register_student(self, name, img_or_path):
-        """Register student using image path or numpy array"""
-        if isinstance(img_or_path, str):
-            img = cv2.imread(img_or_path)
-        else:
-            img = img_or_path
+
+@app.post("/api/camera/start")
+async def start_camera():
+    """Start camera feed."""
+    global _camera_active, _marked_today
+    if not _camera_active:
+        _camera_active = True
+        _marked_today = set()
+        threading.Thread(target=_camera_worker, daemon=True).start()
+    return {"status": "Camera started"}
+
+
+@app.post("/api/camera/stop")
+async def stop_camera():
+    """Stop camera feed."""
+    global _camera_active
+    _camera_active = False
+    return {"status": "Camera stopped"}
+
+
+@app.get("/api/camera/stream")
+async def stream_camera():
+    """Stream camera MJPEG."""
+    return StreamingResponse(_gen_mjpeg(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/api/detections")
+async def get_detections():
+    """Get latest detected faces."""
+    with _cam_lock:
+        results = _latest_results.copy()
+    return {"detections": results}
+
+
+@app.post("/api/upload")
+async def upload_image(file: UploadFile = File(...)):
+    """Upload and process a single image."""
+    try:
+        data = await file.read()
+        arr = np.frombuffer(data, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
         if img is None:
-            return False, "Could not read image"
+            return JSONResponse({"error": "Invalid image"}, status_code=400)
 
-        boxes, _ = self.face_detector.detect(img)
-        if boxes is not None:
-            x1, y1, x2, y2 = [int(b) for b in boxes[0]]
-            face = img[max(0,y1):min(img.shape[0],y2), max(0,x1):min(img.shape[1],x2)]
-            if face.size == 0:
-                return False, "Empty face crop"
-            
-            embedding = self.get_embedding(face)
-            self.known_embeddings[name] = embedding
-            self.save_known_faces()
-            return True, f"Registered {name}"
-        return False, "No face detected"
+        results = engine.process_frame(img)
+        return {
+            "filename": file.filename,
+            "detections": results,
+        }
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
-    def mark_attendance(self, name):
-        """Mark attendance with timestamp"""
-        # Prevent double marking in the same session (optional)
-        if any(log['name'] == name for log in self.attendance_log):
-            return False
-            
-        now = datetime.now()
-        self.attendance_log.append({
-            'name': name,
-            'date': now.strftime('%Y-%m-%d'),
-            'time': now.strftime('%H:%M:%S')
-        })
-        return True
 
-    def export_attendance(self, filepath='data/attendance.csv'):
-        import pandas as pd
-        if not self.attendance_log:
-            return False
+@app.post("/api/enroll")
+async def enroll_face(name: str, cls: str = "", dept: str = "", file: UploadFile = File(...)):
+    """Enroll a person from an image."""
+    try:
+        # Save temp file
+        temp_path = os.path.join(DATASET_DIR, f"temp_{file.filename}")
+        with open(temp_path, "wb") as f:
+            f.write(await file.read())
+
+        # Enroll
+        success = engine.enroll(name, temp_path, meta={"class": cls, "dept": dept})
+        if success:
+            engine.save_embedding(name, EMBEDDINGS_DIR)
+            # Update attendance CSV with new person
+            people_meta = {k: v["meta"] for k, v in engine.db.items()}
+            ensure_today(people_meta)
+            # Clean up
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return {"status": "Enrolled", "name": name}
+        else:
+            return JSONResponse({"error": "No face detected"}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/rebuild-db")
+async def rebuild_db():
+    """Rebuild database from dataset directory with metadata extraction."""
+    try:
+        # Clear engine memory
+        engine.db.clear()
         
-        df = pd.DataFrame(self.attendance_log)
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        # Clear existing embeddings on disk
+        if os.path.exists(EMBEDDINGS_DIR):
+            for f in os.listdir(EMBEDDINGS_DIR):
+                if f.endswith('.npy') or f.endswith('.pkl'):
+                    os.remove(os.path.join(EMBEDDINGS_DIR, f))
+
+        # Scan dataset
+        for person_dir in os.listdir(DATASET_DIR):
+            person_path = os.path.join(DATASET_DIR, person_dir)
+            if not os.path.isdir(person_path):
+                continue
+
+            # Process all images for this person
+            enrolled = False
+            for fname in sorted(os.listdir(person_path)):
+                if fname.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    img_path = os.path.join(person_path, fname)
+                    
+                    # Metadata extraction from filename: "Name_Num__Class__Dept.jpg"
+                    # Split by "__" to get [Name_Num, Class, Dept.jpg]
+                    parts = fname.split("__")
+                    cls = ""
+                    dept = ""
+                    if len(parts) >= 3:
+                        cls = parts[1]
+                        dept = parts[2].rsplit(".", 1)[0]
+                    
+                    # Enroll (using folder name as the primary identity key)
+                    success = engine.enroll(person_dir, img_path, meta={"class": cls, "dept": dept})
+                    if success:
+                        engine.save_embedding(person_dir, EMBEDDINGS_DIR)
+                        enrolled = True
+                        # For now, we only need one good embedding per person
+                        break
+
+        # Re-initialize attendance CSV
+        people_meta = {k: v["meta"] for k, v in engine.db.items()}
         
-        # Append to existing if file exists
-        if os.path.exists(filepath):
-            existing_df = pd.read_csv(filepath)
-            df = pd.concat([existing_df, df]).drop_duplicates(subset=['name', 'date'], keep='last')
+        # Force recreate today's CSV by deleting it if it exists
+        path = get_csv_path()
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception as e:
+                print(f"[WARN] Could not remove old CSV: {e}")
         
-        df.to_csv(filepath, index=False)
-        return True
+        ensure_today(people_meta)
 
-    def run_live_tracking(self, threshold=0.6):
-        """Run live face tracking and attendance marking (lower threshold for Part-fViT)"""
-        cap = cv2.VideoCapture(0)
-        print("Starting Part-fViT Live Tracking... Press 'q' to quit.")
-        print(f"Recognition threshold: {threshold}")
-        
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        return {"status": f"Successfully rebuilt database with {len(engine.db)} identities"}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
 
-            # Detect faces
-            boxes, _ = self.face_detector.detect(frame)
-            
-            if boxes is not None:
-                for box in boxes:
-                    x1, y1, x2, y2 = [int(b) for b in box]
-                    
-                    # Ensure coordinates are within frame
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-                    
-                    face_crop = frame[y1:y2, x1:x2]
-                    if face_crop.size == 0:
-                        continue
 
-                    # Get live embedding from Part-fViT
-                    live_emb = self.get_embedding(face_crop)
-                    
-                    # Compare with database using cosine similarity
-                    best_score = -1
-                    best_name = "Unknown"
-                    
-                    for name, ref_emb in self.known_embeddings.items():
-                        score = np.dot(live_emb, ref_emb)  # Cosine similarity (normalized vectors)
-                        if score > best_score:
-                            best_score = score
-                            best_name = name
-                    
-                    # Visualization
-                    color = (0, 0, 255)  # Red for Unknown
-                    label = f"Unknown ({best_score:.2f})"
-                    
-                    if best_score > threshold:
-                        color = (0, 255, 0)  # Green for Known
-                        label = f"{best_name} ({best_score:.2f})"
-                        self.mark_attendance(best_name)
+@app.get("/api/attendance")
+async def get_today_attendance():
+    """Get today's attendance records."""
+    try:
+        records = get_attendance()
+        present = sum(1 for r in records if r["Status"] == "Present")
+        absent = sum(1 for r in records if r["Status"] == "Absent")
+        return {
+            "total": len(records),
+            "present": present,
+            "absent": absent,
+            "records": records,
+        }
+    except Exception as e:
+        print(f"[ERROR] Failed to get attendance: {e}")
+        return {
+            "total": 0,
+            "present": 0,
+            "absent": 0,
+            "records": [],
+        }
 
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-            # Add model info overlay
-            cv2.putText(frame, "Model: Part-fViT (LAFS)", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            
-            cv2.imshow('Attendance System', frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        
-        cap.release()
-        cv2.destroyAllWindows()
+@app.post("/api/attendance/update")
+async def update_attend(request: AttendanceUpdate):
+    """Update attendance status for a person."""
+    try:
+        people_meta = {k: v["meta"] for k, v in engine.db.items()}
+        success = update_attendance(request.name, request.status, people_meta)
+        if success:
+            return {"status": "Updated"}
+        else:
+            return JSONResponse({"error": "Person not found"}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/attendance/export")
+async def export_attendance():
+    """Download today's attendance as CSV."""
+    csv_path = get_csv_path()
+    if os.path.exists(csv_path):
+        return FileResponse(csv_path, filename=os.path.basename(csv_path))
+    return JSONResponse({"error": "No attendance data"}, status_code=404)
+
 
 if __name__ == "__main__":
-    # 1. Initialize System with Part-fViT
-    system = AttendanceSystem(model_path='lafs_webface_finetune_withaugmentation.pth')
-
-    # 2. Register Students
-    system.register_student("Test1", "test1.jpg")
-    system.register_student("Test2", "test2.jpg")
-    system.register_student("Test3", "test3.jpg")
-    
-    # 3. Start Live Tracking
-    system.run_live_tracking(threshold=0.6)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
